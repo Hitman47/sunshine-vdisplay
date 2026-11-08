@@ -13,6 +13,7 @@
 
 mod display;
 mod driver;
+mod guardian;
 mod install;
 mod ipc;
 mod logging;
@@ -40,6 +41,7 @@ use windows::Win32::System::Threading::{
 use windows::core::GUID;
 
 use crate::driver::Driver;
+use crate::guardian::Guardian;
 use crate::ipc::Handle;
 
 /// Version shown at runtime. Release builds get it from `VDISPLAY_VERSION` (set by CI
@@ -368,6 +370,184 @@ fn cmd_daemon(args: &[String]) -> Result<(), String> {
     })
 }
 
+fn with_guardian_transition<T>(
+    guardian: Option<&Guardian>,
+    operation: &str,
+    action: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let Some(active_guardian) = guardian else {
+        return action();
+    };
+
+    if !active_guardian.is_running()? {
+        return Err(format!("emergency guardian exited before {operation}"));
+    }
+
+    let transition = active_guardian
+        .begin_transition()
+        .map_err(|error| format!("cannot begin {operation}: {error}"))?;
+
+    if !active_guardian.is_running()? {
+        drop(transition);
+        return Err(format!(
+            "emergency guardian exited while preparing {operation}"
+        ));
+    }
+    if active_guardian.emergency_pending()? {
+        drop(transition);
+        return Err(format!(
+            "emergency restoration was requested before {operation}"
+        ));
+    }
+
+    let result = action();
+    drop(transition);
+
+    // Check after releasing the mutex: the guardian signals this manual-reset
+    // event before waiting for the mutex, so a request raised during the API call
+    // remains observable here even if the guardian acquires the mutex immediately.
+    if !active_guardian.is_running()? {
+        return Err(format!("emergency guardian exited during {operation}"));
+    }
+    if active_guardian.emergency_pending()? {
+        return Err(format!(
+            "emergency restoration was requested during {operation}"
+        ));
+    }
+
+    result
+}
+
+fn guardian_fallback_is_safe(active_guardian: &mut Guardian, context: &str) -> bool {
+    match active_guardian.try_wait() {
+        Ok(Some(status)) if status.success() => {
+            log!(
+                "daemon: guardian restoration was verified after {context}; local fallback is unnecessary"
+            );
+            false
+        }
+        Ok(Some(status)) => {
+            log!(
+                "daemon: guardian exited abnormally ({status}) after {context}; local fallback may proceed"
+            );
+            true
+        }
+        Ok(None) => {
+            log!(
+                "CRITICAL: guardian is still running after {context}; skipping local fallback to avoid concurrent display changes"
+            );
+            false
+        }
+        Err(error) => {
+            log!(
+                "CRITICAL: cannot establish whether guardian exited after {context} ({error}); skipping local fallback"
+            );
+            false
+        }
+    }
+}
+
+fn teardown_session(
+    driver: &Driver,
+    guid: GUID,
+    target: Option<(windows::Win32::Foundation::LUID, u32)>,
+    snapshot: Option<&display::Config>,
+    guardian: &mut Option<Guardian>,
+) {
+    if let Some(active_guardian) = guardian.as_mut() {
+        match active_guardian.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                log!("daemon: independent guardian restored and verified the original topology");
+                return;
+            }
+            Ok(Some(status)) => {
+                log!(
+                    "guardian already exited abnormally ({status}); local topology reconciliation may proceed"
+                );
+            }
+            Ok(None) => match active_guardian.restore_and_wait() {
+                Ok(()) => {
+                    log!(
+                        "daemon: independent guardian restored and verified the original topology"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    log!("ERROR: guardian restoration request failed: {error}");
+                    if !guardian_fallback_is_safe(active_guardian, "restoration request failure") {
+                        return;
+                    }
+                }
+            },
+            Err(error) => match active_guardian.restore_and_wait() {
+                Ok(()) => {
+                    log!("daemon: guardian restored topology after process-status error: {error}");
+                    return;
+                }
+                Err(restore_error) => {
+                    log!(
+                        "ERROR: guardian status failed ({error}) and restoration failed ({restore_error})"
+                    );
+                    if !guardian_fallback_is_safe(
+                        active_guardian,
+                        "process-status/restoration failure",
+                    ) {
+                        return;
+                    }
+                }
+            },
+        }
+    }
+
+    match driver.remove_display(guid) {
+        Ok(()) => {
+            log!("daemon: virtual display removed by local fallback");
+            let _ = std::fs::remove_file(state_path());
+        }
+        Err(error) => log!("daemon: local fallback could not remove virtual display: {error}"),
+    }
+    let _ = std::fs::remove_file(state_path());
+
+    if let Some((adapter_luid, target_id)) = target {
+        display::wait_for_display_gone(adapter_luid, target_id, Duration::from_secs(3));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    if let Some(snapshot) = snapshot {
+        let mut restored = false;
+        for attempt in 1..=3 {
+            let mut candidate = snapshot.clone();
+            match candidate.apply(SDC_ALLOW_CHANGES) {
+                Ok(()) => {
+                    std::thread::sleep(Duration::from_millis(350));
+                    match display::Config::query() {
+                        Ok(current) if snapshot.same_active_layout(&current) => {
+                            log!(
+                                "daemon: fallback topology restoration verified (attempt {attempt}/3)"
+                            );
+                            restored = true;
+                            break;
+                        }
+                        Ok(current) => log!(
+                            "daemon: fallback restore attempt {attempt}/3 did not verify; {} active path(s)",
+                            current.paths.len()
+                        ),
+                        Err(error) => log!(
+                            "daemon: fallback restore verification attempt {attempt}/3 failed: {error}"
+                        ),
+                    }
+                }
+                Err(error) => log!("daemon: fallback restore attempt {attempt}/3 failed: {error}"),
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if !restored {
+            log!(
+                "CRITICAL: neither guardian nor daemon fallback could verify the original display topology"
+            );
+        }
+    }
+}
 fn run_daemon(opts: &Options) -> Result<(), String> {
     log!("daemon: vdisplay {VERSION}");
     let (_alive, stop) = ipc::daemon_objects()?;
@@ -419,75 +599,49 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
     };
 
     let guid = monitor_guid(&opts.id);
+    let mut guardian = if opts.exclusive {
+        log!("exclusive: starting independent emergency guardian before display creation");
+        Some(Guardian::start(guid)?)
+    } else {
+        None
+    };
     let serial = format!("{:012X}", guid.data1 as u64 | ((guid.data2 as u64) << 32));
     // Recorded before adding so a killed daemon's display can still be cleaned up.
     let _ = std::fs::write(state_path(), format!("{:032x}", guid.to_u128()));
-    let added = driver
-        .add_display(
-            opts.width,
-            opts.height,
-            opts.refresh_mhz,
-            guid,
-            &opts.name,
-            &serial,
-        )
-        .map_err(|e| format!("failed to add virtual display: {e}"))?;
+    let added_result =
+        with_guardian_transition(guardian.as_ref(), "virtual display creation", || {
+            driver
+                .add_display(
+                    opts.width,
+                    opts.height,
+                    opts.refresh_mhz,
+                    guid,
+                    &opts.name,
+                    &serial,
+                )
+                .map_err(|error| error.to_string())
+        });
+    let added = match added_result {
+        Ok(added) => added,
+        Err(error) => {
+            teardown_session(&driver, guid, None, snapshot.as_ref(), &mut guardian);
+            return Err(format!("failed to add virtual display: {error}"));
+        }
+    };
     log!(
         "daemon: added display {guid:?} (target {})",
         added.target_id
     );
 
-    let teardown = |driver: &Driver| {
-        match driver.remove_display(guid) {
-            Ok(()) => {
-                log!("daemon: virtual display removed");
-                let _ = std::fs::remove_file(state_path());
-            }
-            Err(e) => log!("daemon: failed to remove virtual display: {e}"),
-        }
-        if let Some(snapshot) = snapshot.as_ref() {
-            display::wait_for_display_gone(
-                added.adapter_luid,
-                added.target_id,
-                Duration::from_secs(3),
-            );
-            std::thread::sleep(Duration::from_millis(300));
-
-            let mut restored = false;
-            for attempt in 1..=3 {
-                let mut candidate = snapshot.clone();
-                match candidate.apply(SDC_ALLOW_CHANGES) {
-                    Ok(()) => {
-                        std::thread::sleep(Duration::from_millis(350));
-                        match display::Config::query() {
-                            Ok(current) if snapshot.same_active_layout(&current) => {
-                                log!(
-                                    "daemon: previous display layout restored and verified (attempt {attempt}/3)"
-                                );
-                                restored = true;
-                                break;
-                            }
-                            Ok(current) => log!(
-                                "daemon: restore attempt {attempt}/3 applied but did not verify; current topology: {} active path(s)",
-                                current.paths.len()
-                            ),
-                            Err(e) => {
-                                log!("daemon: restore verification attempt {attempt}/3 failed: {e}")
-                            }
-                        }
-                    }
-                    Err(e) => log!("daemon: restore attempt {attempt}/3 failed: {e}"),
-                }
-                std::thread::sleep(Duration::from_millis(250));
-            }
-            if !restored {
-                log!(
-                    "ERROR: previous display layout could not be verified after 3 restore attempts; manual recovery may be required"
-                );
-            }
-        }
+    let teardown = |driver: &Driver, guardian: &mut Option<Guardian>| {
+        teardown_session(
+            driver,
+            guid,
+            Some((added.adapter_luid, added.target_id)),
+            snapshot.as_ref(),
+            guardian,
+        );
     };
-
     let device = match display::wait_for_display_name(
         added.adapter_luid,
         added.target_id,
@@ -500,39 +654,75 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
                     "exclusive startup aborted before topology switching: the virtual display never became active, so a --primary fallback cannot be applied safely"
                 );
             }
-            teardown(&driver);
+            teardown(&driver, &mut guardian);
             return Err(error);
         }
     };
     log!("daemon: virtual display is {device}");
 
-    if let Err(e) = display::set_mode(&device, opts.width, opts.height, opts.refresh_mhz) {
-        log!("daemon: cannot set display mode: {e}");
+    let mode_result =
+        with_guardian_transition(guardian.as_ref(), "virtual display mode setup", || {
+            display::set_mode(&device, opts.width, opts.height, opts.refresh_mhz)
+                .map_err(|e| e.to_string())
+        });
+    if let Err(error) = mode_result {
+        if opts.exclusive {
+            log!("ERROR: exclusive startup aborted during display-mode setup: {error}");
+            teardown(&driver, &mut guardian);
+            return Err(format!(
+                "exclusive startup aborted during display-mode setup: {error}"
+            ));
+        }
+        log!("daemon: cannot set display mode: {error}");
     }
     if opts.exclusive {
-        log!("exclusive: attempting to disable every display except {device}");
-        match display::make_exclusive(added.adapter_luid, added.target_id) {
+        if guardian.is_none() {
+            teardown(&driver, &mut guardian);
+            return Err("exclusive mode refused: emergency guardian is not running".into());
+        }
+
+        let guardian_status = guardian
+            .as_mut()
+            .expect("guardian checked above")
+            .try_wait();
+        match guardian_status {
+            Ok(None) => {}
+            Ok(Some(status)) => {
+                teardown(&driver, &mut guardian);
+                return Err(format!(
+                    "emergency guardian exited before exclusive activation: {status}"
+                ));
+            }
+            Err(error) => {
+                teardown(&driver, &mut guardian);
+                return Err(format!(
+                    "cannot verify emergency guardian before exclusive activation: {error}"
+                ));
+            }
+        }
+
+        let heartbeat_result = guardian
+            .as_ref()
+            .expect("guardian checked above")
+            .heartbeat();
+        if let Err(error) = heartbeat_result {
+            teardown(&driver, &mut guardian);
+            return Err(format!(
+                "cannot heartbeat emergency guardian before exclusive activation: {error}"
+            ));
+        }
+
+        log!("exclusive: independent guardian armed; attempting topology switch");
+        match with_guardian_transition(guardian.as_ref(), "exclusive topology switch", || {
+            display::make_exclusive(added.adapter_luid, added.target_id).map_err(|e| e.to_string())
+        }) {
             Ok(()) => log!("exclusive: active; physical displays disabled"),
-            Err(exclusive_error) => {
-                log!("WARNING: --exclusive failed: {exclusive_error}");
-                log!(
-                    "fallback: attempting --primary so the stream can continue without exclusive mode"
-                );
-                match display::set_primary(added.adapter_luid, added.target_id) {
-                    Ok(()) => log!(
-                        "fallback: --primary succeeded; continuing the stream in non-exclusive mode"
-                    ),
-                    Err(primary_error) => {
-                        let error = format!(
-                            "exclusive mode failed ({exclusive_error}); --primary fallback also failed ({primary_error})"
-                        );
-                        log!(
-                            "ERROR: {error}; aborting the stream and restoring the pre-stream display layout"
-                        );
-                        teardown(&driver);
-                        return Err(error);
-                    }
-                }
+            Err(error) => {
+                log!("ERROR: exclusive activation failed: {error}");
+                teardown(&driver, &mut guardian);
+                return Err(format!(
+                    "exclusive activation failed; session aborted and restoration requested: {error}"
+                ));
             }
         }
     } else if opts.primary {
@@ -542,9 +732,18 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
         }
     }
     if let Some(hdr) = opts.hdr {
-        match display::set_hdr(added.adapter_luid, added.target_id, hdr) {
+        match with_guardian_transition(guardian.as_ref(), "HDR configuration", || {
+            display::set_hdr(added.adapter_luid, added.target_id, hdr).map_err(|e| e.to_string())
+        }) {
             Ok(()) => log!("daemon: HDR {}", if hdr { "enabled" } else { "disabled" }),
-            Err(e) => log!("daemon: cannot set HDR: {e}"),
+            Err(error) if opts.exclusive => {
+                log!("ERROR: exclusive startup aborted during HDR configuration: {error}");
+                teardown(&driver, &mut guardian);
+                return Err(format!(
+                    "exclusive startup aborted during HDR configuration: {error}"
+                ));
+            }
+            Err(error) => log!("daemon: cannot set HDR: {error}"),
         }
     }
 
@@ -582,13 +781,56 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
                 log!("daemon: driver stopped answering pings");
                 break;
             }
+            if let Some(active_guardian) = guardian.as_mut() {
+                match active_guardian.try_wait() {
+                    Ok(Some(status)) => {
+                        if status.success() {
+                            log!(
+                                "guardian: emergency restoration completed; ending exclusive session"
+                            );
+                        } else {
+                            log!(
+                                "guardian: exited abnormally ({status}); local restoration will be attempted"
+                            );
+                        }
+                        break;
+                    }
+                    Ok(None) => {
+                        match active_guardian.emergency_pending() {
+                            Ok(true) => {
+                                log!(
+                                    "guardian: emergency restoration requested; ending exclusive session"
+                                );
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                log!(
+                                    "guardian: cannot inspect emergency state: {error}; ending exclusive session"
+                                );
+                                break;
+                            }
+                        }
+                        if let Err(error) = active_guardian.heartbeat() {
+                            log!("guardian: heartbeat failed: {error}; ending exclusive session");
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        log!(
+                            "guardian: process status check failed: {error}; ending exclusive session"
+                        );
+                        break;
+                    }
+                }
+            }
         } else {
             log!("daemon: wait failed ({r:?})");
             break;
         }
     }
 
-    teardown(&driver);
+    teardown(&driver, &mut guardian);
     pinging.store(false, Ordering::Relaxed);
     if let Some(p) = pinger {
         let _ = p.join();
@@ -605,6 +847,175 @@ fn attach_console() {
     }
 }
 
+fn cmd_guardian_recovery_test(args: &[String]) -> Result<(), String> {
+    if crate::ipc::daemon_running() {
+        return Err("a vdisplay daemon is already active; guardian recovery test refused".into());
+    }
+
+    println!(
+        "WARNING: this test creates a real temporary 1920x1080 virtual monitor, then asks the independent guardian to remove it. It does not call --exclusive or --primary, but Windows may briefly reflow the desktop."
+    );
+    let [confirmation] = args else {
+        return Err("usage: vdisplay guardian-recovery-test RESTORE-TEST".into());
+    };
+    if confirmation != "RESTORE-TEST" {
+        return Err("guardian recovery test cancelled; no display was created".into());
+    }
+
+    let before = display::Config::query().map_err(|e| {
+        format!("cannot capture display topology before guardian recovery test: {e}")
+    })?;
+    let driver = std::sync::Arc::new(
+        crate::driver::Driver::open()
+            .map_err(|e| format!("cannot open SudoVDA for guardian recovery test: {e}"))?,
+    );
+
+    // Keep the SudoVDA watchdog alive for the entire test, matching run_daemon().
+    let watchdog = driver
+        .watchdog()
+        .map_err(|e| format!("cannot query driver watchdog: {e}"))?;
+    let pinging = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let ping_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pinger = (watchdog.timeout > 0).then(|| {
+        let driver = std::sync::Arc::clone(&driver);
+        let pinging = std::sync::Arc::clone(&pinging);
+        let ping_failed = std::sync::Arc::clone(&ping_failed);
+        let interval =
+            std::time::Duration::from_millis((watchdog.timeout as u64 * 1000 / 3).max(200));
+        std::thread::spawn(move || {
+            let mut failures = 0;
+            while pinging.load(std::sync::atomic::Ordering::Relaxed) {
+                if driver.ping().is_err() {
+                    failures += 1;
+                    if failures > 3 {
+                        ping_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                } else {
+                    failures = 0;
+                }
+                std::thread::sleep(interval);
+            }
+        })
+    });
+
+    // Keep the Guardian outside the test closure so every error path can request
+    // and await restoration before stopping the driver watchdog.
+    let mut guardian: Option<guardian::Guardian> = None;
+    let test_result = (|| -> Result<(), String> {
+        let unique_id = format!(
+            "GuardianRecoveryTest-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("system clock is before UNIX epoch: {e}"))?
+                .as_nanos()
+        );
+        let guid = monitor_guid(&unique_id);
+        let serial = format!("{:012X}", guid.data1 as u64 | ((guid.data2 as u64) << 32));
+
+        // Guardian captures the original layout before the temporary monitor is added.
+        guardian = Some(guardian::Guardian::start(guid)?);
+        println!(
+            "Guardian armed. Creating a temporary 1920x1080 virtual display; --exclusive and --primary are not used."
+        );
+        println!(
+            "Windows may briefly update the desktop layout while the temporary monitor is present."
+        );
+
+        let active_guardian = guardian
+            .as_ref()
+            .ok_or_else(|| "guardian was not initialized".to_string())?;
+        let added = with_guardian_transition(
+            Some(active_guardian),
+            "guardian recovery test display creation",
+            || {
+                driver
+                    .add_display(1920, 1080, 60_000, guid, "GdnRecovery", &serial)
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+
+        let device = display::wait_for_display_name(
+            added.adapter_luid,
+            added.target_id,
+            std::time::Duration::from_secs(10),
+        )?;
+        if ping_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("SudoVDA watchdog ping failed during temporary monitor creation".into());
+        }
+
+        guardian
+            .as_ref()
+            .ok_or_else(|| "guardian disappeared before heartbeat".to_string())?
+            .heartbeat()?;
+        guardian
+            .as_mut()
+            .ok_or_else(|| "guardian disappeared before restoration request".to_string())?
+            .restore_and_wait()
+            .map_err(|e| format!("guardian did not confirm restoration: {e}"))?;
+
+        // wait_for_display_gone polls active paths; the exact snapshot comparison
+        // below then verifies that the temporary target is no longer active and
+        // every original active path has returned.
+        display::wait_for_display_gone(
+            added.adapter_luid,
+            added.target_id,
+            std::time::Duration::from_secs(10),
+        );
+        let after = display::Config::query().map_err(|e| {
+            format!("guardian exited, but final display-topology query failed: {e}")
+        })?;
+        if !before.same_active_layout(&after) {
+            return Err(
+                "CRITICAL: guardian completed but the original active display topology was not restored; do not start another vdisplay session".into(),
+            );
+        }
+        if ping_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("SudoVDA watchdog ping failed during guardian restoration".into());
+        }
+
+        println!(
+            "SUCCESS: temporary monitor {device} was created, removed by the independent guardian, and the original active display topology was verified unchanged."
+        );
+        Ok(())
+    })();
+
+    // Always request/await guardian restoration before stopping the watchdog.
+    let cleanup_result = match guardian.as_mut() {
+        Some(active_guardian) => active_guardian.restore_and_wait(),
+        None => Ok(()),
+    };
+    pinging.store(false, std::sync::atomic::Ordering::Relaxed);
+    let pinger_result = match pinger {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| "SudoVDA watchdog thread panicked".to_string()),
+        None => Ok(()),
+    };
+
+    let mut errors = Vec::new();
+    if let Err(error) = test_result {
+        errors.push(error);
+    }
+    if let Err(error) = cleanup_result {
+        errors.push(format!(
+            "CRITICAL: guardian cleanup/restoration failed: {error}"
+        ));
+    }
+    if let Err(error) = pinger_result {
+        errors.push(error);
+    }
+    if ping_failed.load(std::sync::atomic::Ordering::Relaxed) {
+        errors.push("SudoVDA watchdog reported more than three consecutive ping failures".into());
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 fn main() -> ExitCode {
     attach_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -615,6 +1026,9 @@ fn main() -> ExitCode {
         "start" => cmd_start(rest),
         "stop" => cmd_stop(),
         "daemon" => cmd_daemon(rest),
+        "guardian" => guardian::cmd(rest),
+        "guardian-test" => guardian::self_test(),
+        "guardian-recovery-test" => cmd_guardian_recovery_test(rest),
         "install-driver" | "--install-driver" => install::install(),
         "uninstall-driver" | "--uninstall-driver" => install::uninstall(),
         "version" | "--version" | "-V" => {

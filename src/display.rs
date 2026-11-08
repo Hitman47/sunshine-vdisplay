@@ -12,14 +12,13 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
     QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE, QUERY_DISPLAY_CONFIG_FLAGS,
-    QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VIRTUAL_MODE_AWARE, SET_DISPLAY_CONFIG_FLAGS,
-    SetDisplayConfig,
+    QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_VIRTUAL_MODE_AWARE, SET_DISPLAY_CONFIG_FLAGS, SetDisplayConfig,
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{
-    CDS_UPDATEREGISTRY, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+    CDS_TYPE, ChangeDisplaySettingsExW, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
     DISPLAYCONFIG_PATH_ACTIVE, DISPLAYCONFIG_PATH_MODE_IDX_INVALID, DM_DISPLAYFREQUENCY,
     DM_PELSHEIGHT, DM_PELSWIDTH, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
 };
@@ -102,11 +101,7 @@ impl Config {
             SetDisplayConfig(
                 Some(&self.paths),
                 Some(&self.modes),
-                SDC_APPLY
-                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG
-                    | SDC_SAVE_TO_DATABASE
-                    | SDC_VIRTUAL_MODE_AWARE
-                    | extra,
+                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE | extra,
             )
         };
         if r == ERROR_SUCCESS.0 as i32 {
@@ -326,13 +321,7 @@ pub fn set_mode(device: &str, width: u32, height: u32, refresh_mhz: u32) -> Resu
         for hz in [target, alt] {
             dm.dmDisplayFrequency = hz;
             let r = unsafe {
-                ChangeDisplaySettingsExW(
-                    PCWSTR(wname.as_ptr()),
-                    Some(&dm),
-                    None,
-                    CDS_UPDATEREGISTRY,
-                    None,
-                )
+                ChangeDisplaySettingsExW(PCWSTR(wname.as_ptr()), Some(&dm), None, CDS_TYPE(0), None)
             };
             if r == DISP_CHANGE_SUCCESSFUL {
                 log!("baseline mode {width}x{height}@{hz} applied to {device}");
