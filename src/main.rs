@@ -136,7 +136,8 @@ fn parse_options(args: &[String]) -> Result<Options, String> {
             "--fps" => refresh_mhz = parse_fps(&value()?)?,
             "--hdr" => {
                 // Optional value so `--hdr %SUNSHINE_CLIENT_HDR%` works.
-                let v = it.next_if(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"));
+                let v = it
+                    .next_if(|v| v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false"));
                 hdr = Some(v.is_none_or(|v| v.eq_ignore_ascii_case("true")));
             }
             "--no-hdr" => hdr = Some(false),
@@ -269,7 +270,9 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
         log!("stopped previous virtual display");
     }
     if !install::driver_present() {
-        return Err("SudoVDA driver not found; run `vdisplay install-driver` once to install it".into());
+        return Err(
+            "SudoVDA driver not found; run `vdisplay install-driver` once to install it".into(),
+        );
     }
     remove_stale_display();
 
@@ -408,7 +411,9 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
 
     let changes_topology = opts.primary || opts.exclusive;
     let snapshot = if changes_topology {
-        display::Config::query().ok()
+        Some(display::Config::query().map_err(|e| {
+            format!("cannot snapshot the current display layout before changing topology: {e}")
+        })?)
     } else {
         None
     };
@@ -440,27 +445,64 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
             }
             Err(e) => log!("daemon: failed to remove virtual display: {e}"),
         }
-        if let Some(mut snapshot) = snapshot.clone() {
+        if let Some(snapshot) = snapshot.as_ref() {
             display::wait_for_display_gone(
                 added.adapter_luid,
                 added.target_id,
                 Duration::from_secs(3),
             );
             std::thread::sleep(Duration::from_millis(300));
-            match snapshot.apply(SDC_ALLOW_CHANGES) {
-                Ok(()) => log!("daemon: restored previous display layout"),
-                Err(e) => log!("daemon: cannot restore previous display layout: {e}"),
+
+            let mut restored = false;
+            for attempt in 1..=3 {
+                let mut candidate = snapshot.clone();
+                match candidate.apply(SDC_ALLOW_CHANGES) {
+                    Ok(()) => {
+                        std::thread::sleep(Duration::from_millis(350));
+                        match display::Config::query() {
+                            Ok(current) if snapshot.same_active_layout(&current) => {
+                                log!(
+                                    "daemon: previous display layout restored and verified (attempt {attempt}/3)"
+                                );
+                                restored = true;
+                                break;
+                            }
+                            Ok(current) => log!(
+                                "daemon: restore attempt {attempt}/3 applied but did not verify; current topology: {} active path(s)",
+                                current.paths.len()
+                            ),
+                            Err(e) => {
+                                log!("daemon: restore verification attempt {attempt}/3 failed: {e}")
+                            }
+                        }
+                    }
+                    Err(e) => log!("daemon: restore attempt {attempt}/3 failed: {e}"),
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            if !restored {
+                log!(
+                    "ERROR: previous display layout could not be verified after 3 restore attempts; manual recovery may be required"
+                );
             }
         }
     };
 
-    let Some(device) = display::wait_for_display_name(
+    let device = match display::wait_for_display_name(
         added.adapter_luid,
         added.target_id,
         Duration::from_secs(10),
-    ) else {
-        teardown(&driver);
-        return Err("virtual display was added but never became active".into());
+    ) {
+        Ok(device) => device,
+        Err(error) => {
+            if opts.exclusive {
+                log!(
+                    "exclusive startup aborted before topology switching: the virtual display never became active, so a --primary fallback cannot be applied safely"
+                );
+            }
+            teardown(&driver);
+            return Err(error);
+        }
     };
     log!("daemon: virtual display is {device}");
 
@@ -468,9 +510,30 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
         log!("daemon: cannot set display mode: {e}");
     }
     if opts.exclusive {
+        log!("exclusive: attempting to disable every display except {device}");
         match display::make_exclusive(added.adapter_luid, added.target_id) {
-            Ok(()) => log!("daemon: other displays disabled"),
-            Err(e) => log!("daemon: cannot disable other displays: {e}"),
+            Ok(()) => log!("exclusive: active; physical displays disabled"),
+            Err(exclusive_error) => {
+                log!("WARNING: --exclusive failed: {exclusive_error}");
+                log!(
+                    "fallback: attempting --primary so the stream can continue without exclusive mode"
+                );
+                match display::set_primary(added.adapter_luid, added.target_id) {
+                    Ok(()) => log!(
+                        "fallback: --primary succeeded; continuing the stream in non-exclusive mode"
+                    ),
+                    Err(primary_error) => {
+                        let error = format!(
+                            "exclusive mode failed ({exclusive_error}); --primary fallback also failed ({primary_error})"
+                        );
+                        log!(
+                            "ERROR: {error}; aborting the stream and restoring the pre-stream display layout"
+                        );
+                        teardown(&driver);
+                        return Err(error);
+                    }
+                }
+            }
         }
     } else if opts.primary {
         match display::set_primary(added.adapter_luid, added.target_id) {

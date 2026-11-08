@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     DICD_GENERATE_ID, DIF_REGISTERDEVICE, DIF_REMOVE, DIGCF_PRESENT, GUID_DEVCLASS_DISPLAY,
-    HDEVINFO, INSTALLFLAG_FORCE, SP_DEVINFO_DATA, SPDRP_HARDWAREID, SetupDiCallClassInstaller,
-    SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW, SetupDiDestroyDeviceInfoList,
-    SetupDiEnumDeviceInfo, SetupDiGetClassDevsW, SetupDiGetDeviceRegistryPropertyW,
-    SetupDiSetDeviceRegistryPropertyW, SetupUninstallOEMInfW, SUOI_FORCEDELETE,
+    HDEVINFO, INSTALLFLAG_FORCE, SP_DEVINFO_DATA, SPDRP_HARDWAREID, SUOI_FORCEDELETE,
+    SetupDiCallClassInstaller, SetupDiCreateDeviceInfoList, SetupDiCreateDeviceInfoW,
+    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+    SetupDiGetDeviceRegistryPropertyW, SetupDiSetDeviceRegistryPropertyW, SetupUninstallOEMInfW,
     UpdateDriverForPlugAndPlayDevicesW,
 };
 use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
@@ -40,9 +40,18 @@ use crate::log;
 const HARDWARE_ID: &str = r"Root\SudoMaker\SudoVDA";
 
 const FILES: &[(&str, &[u8])] = &[
-    ("SudoVDA.inf", include_bytes!("../drivers/sudovda/SudoVDA.inf")),
-    ("SudoVDA.dll", include_bytes!("../drivers/sudovda/SudoVDA.dll")),
-    ("sudovda.cat", include_bytes!("../drivers/sudovda/sudovda.cat")),
+    (
+        "SudoVDA.inf",
+        include_bytes!("../drivers/sudovda/SudoVDA.inf"),
+    ),
+    (
+        "SudoVDA.dll",
+        include_bytes!("../drivers/sudovda/SudoVDA.dll"),
+    ),
+    (
+        "sudovda.cat",
+        include_bytes!("../drivers/sudovda/sudovda.cat"),
+    ),
 ];
 const CERT: &[u8] = include_bytes!("../drivers/sudovda/sudovda.cer");
 
@@ -65,9 +74,11 @@ pub fn install() -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !driver_present() {
         if Instant::now() > deadline {
-            return Err("SudoVDA driver was installed but its device did not appear \
+            return Err(
+                "SudoVDA driver was installed but its device did not appear \
                         (a reboot may be required)"
-                .into());
+                    .into(),
+            );
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -92,9 +103,8 @@ pub fn uninstall() -> Result<(), String> {
     log!("removed {removed} SudoVDA device(s)");
     for inf in sudovda_oem_infs() {
         let name = inf.to_string_lossy();
-        let ok = unsafe {
-            SetupUninstallOEMInfW(PCWSTR(wide(&name).as_ptr()), SUOI_FORCEDELETE, None)
-        };
+        let ok =
+            unsafe { SetupUninstallOEMInfW(PCWSTR(wide(&name).as_ptr()), SUOI_FORCEDELETE, None) };
         if ok.as_bool() {
             log!("deleted driver package {name}");
         } else {
@@ -162,8 +172,7 @@ fn install_elevated() -> Result<(), String> {
 fn extract(dir: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     for (name, data) in FILES {
-        std::fs::write(dir.join(name), data)
-            .map_err(|e| format!("cannot extract {name}: {e}"))?;
+        std::fs::write(dir.join(name), data).map_err(|e| format!("cannot extract {name}: {e}"))?;
     }
     Ok(dir.join(FILES[0].0))
 }
@@ -267,7 +276,10 @@ fn with_sudovda_devices(
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .collect::<Vec<_>>(),
             );
-            if ids.split('\0').any(|id| id.eq_ignore_ascii_case(HARDWARE_ID)) {
+            if ids
+                .split('\0')
+                .any(|id| id.eq_ignore_ascii_case(HARDWARE_ID))
+            {
                 count += 1;
                 result = f(set, &dev);
             }
@@ -300,7 +312,9 @@ fn create_device_node() -> Result<(), String> {
             DICD_GENERATE_ID,
             Some(&mut dev),
         )
-        .and_then(|()| SetupDiSetDeviceRegistryPropertyW(set, &mut dev, SPDRP_HARDWAREID, Some(&hwid)))
+        .and_then(|()| {
+            SetupDiSetDeviceRegistryPropertyW(set, &mut dev, SPDRP_HARDWAREID, Some(&hwid))
+        })
         .and_then(|()| SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, Some(&dev)))
         .map_err(|e| format!("cannot create SudoVDA device node: {e}"));
         let _ = SetupDiDestroyDeviceInfoList(set);
@@ -324,7 +338,11 @@ fn install_inf(inf: &Path) -> Result<(), String> {
     .map_err(|e| format!("cannot install SudoVDA driver: {e}"))?;
     log!(
         "SudoVDA driver installed{}",
-        if reboot.as_bool() { " (reboot required)" } else { "" }
+        if reboot.as_bool() {
+            " (reboot required)"
+        } else {
+            ""
+        }
     );
     Ok(())
 }

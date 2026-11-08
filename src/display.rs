@@ -11,8 +11,10 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_RATIONAL,
     DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
     DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo, GetDisplayConfigBufferSizes,
-    QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE,
-    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SET_DISPLAY_CONFIG_FLAGS, SetDisplayConfig,
+    QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS, QDC_VIRTUAL_MODE_AWARE, QUERY_DISPLAY_CONFIG_FLAGS,
+    QueryDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_SAVE_TO_DATABASE,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VIRTUAL_MODE_AWARE, SET_DISPLAY_CONFIG_FLAGS,
+    SetDisplayConfig,
 };
 use windows::Win32::Foundation::{ERROR_SUCCESS, LUID};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
@@ -47,20 +49,30 @@ pub struct Config {
 
 impl Config {
     pub fn query() -> Result<Self, String> {
-        // The topology can change between the two calls; retry like the docs recommend.
+        Self::query_with_flags(QDC_ONLY_ACTIVE_PATHS)
+    }
+
+    fn query_with_flags(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Result<Self, String> {
+        // Interpret DISPLAYCONFIG_PATH_INFO unions using the virtual-mode-aware layout.
+        let flags = flags | QDC_VIRTUAL_MODE_AWARE;
+        // The topology can change between the two calls. Keep retrying and preserve
+        // the actual Win32 status instead of collapsing every failure into one message.
+        let mut last_query_error = None;
         for _ in 0..5 {
             let (mut path_count, mut mode_count) = (0u32, 0u32);
-            let r = unsafe {
-                GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut path_count, &mut mode_count)
-            };
+            let r = unsafe { GetDisplayConfigBufferSizes(flags, &mut path_count, &mut mode_count) };
             if r != ERROR_SUCCESS {
-                return Err(format!("GetDisplayConfigBufferSizes failed: {r:?}"));
+                return Err(format!(
+                    "GetDisplayConfigBufferSizes failed: {} (0x{:08X})",
+                    r.0, r.0
+                ));
             }
+
             let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); path_count as usize];
             let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); mode_count as usize];
             let r = unsafe {
                 QueryDisplayConfig(
-                    QDC_ONLY_ACTIVE_PATHS,
+                    flags,
                     &mut path_count,
                     paths.as_mut_ptr(),
                     &mut mode_count,
@@ -73,9 +85,16 @@ impl Config {
                 modes.truncate(mode_count as usize);
                 return Ok(Config { paths, modes });
             }
+
+            last_query_error = Some(r.0);
             sleep(Duration::from_millis(50));
         }
-        Err("QueryDisplayConfig failed".into())
+
+        let code = last_query_error.unwrap_or_default();
+        Err(format!(
+            "QueryDisplayConfig failed after 5 attempts: {} (0x{:08X})",
+            code, code
+        ))
     }
 
     pub fn apply(&mut self, extra: SET_DISPLAY_CONFIG_FLAGS) -> Result<(), String> {
@@ -83,13 +102,17 @@ impl Config {
             SetDisplayConfig(
                 Some(&self.paths),
                 Some(&self.modes),
-                SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_SAVE_TO_DATABASE | extra,
+                SDC_APPLY
+                    | SDC_USE_SUPPLIED_DISPLAY_CONFIG
+                    | SDC_SAVE_TO_DATABASE
+                    | SDC_VIRTUAL_MODE_AWARE
+                    | extra,
             )
         };
         if r == ERROR_SUCCESS.0 as i32 {
             Ok(())
         } else {
-            Err(format!("SetDisplayConfig failed: {r}"))
+            Err(format!("SetDisplayConfig failed: {r} (0x{:08X})", r as u32))
         }
     }
 
@@ -107,9 +130,50 @@ impl Config {
             same_luid(p.targetInfo.adapterId, adapter) && p.targetInfo.id == target_id
         })
     }
+
+    /// Checks that the same active source/target paths and desktop rectangles are back.
+    pub fn same_active_layout(&self, other: &Self) -> bool {
+        if self.paths.len() != other.paths.len() {
+            return false;
+        }
+
+        self.paths.iter().all(|path| {
+            let Some(other_path) = other.paths.iter().find(|candidate| {
+                same_luid(candidate.sourceInfo.adapterId, path.sourceInfo.adapterId)
+                    && candidate.sourceInfo.id == path.sourceInfo.id
+                    && same_luid(candidate.targetInfo.adapterId, path.targetInfo.adapterId)
+                    && candidate.targetInfo.id == path.targetInfo.id
+            }) else {
+                return false;
+            };
+
+            if path.targetInfo.refreshRate.Numerator != other_path.targetInfo.refreshRate.Numerator
+                || path.targetInfo.refreshRate.Denominator
+                    != other_path.targetInfo.refreshRate.Denominator
+            {
+                return false;
+            }
+
+            match (
+                self.source_mode_index(path),
+                other.source_mode_index(other_path),
+            ) {
+                (Some(left), Some(right)) => unsafe {
+                    let a = &self.modes[left].Anonymous.sourceMode;
+                    let b = &other.modes[right].Anonymous.sourceMode;
+                    a.width == b.width
+                        && a.height == b.height
+                        && a.position.x == b.position.x
+                        && a.position.y == b.position.y
+                },
+                (None, None) => true,
+                _ => false,
+            }
+        })
+    }
 }
 
-fn source_gdi_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+fn source_gdi_name(path: &DISPLAYCONFIG_PATH_INFO) -> Result<String, String> {
     let mut name = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
         header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
             r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
@@ -120,25 +184,107 @@ fn source_gdi_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
         ..Default::default()
     };
     let r = unsafe { DisplayConfigGetDeviceInfo(&mut name.header) };
-    (r == 0).then(|| from_wide(&name.viewGdiDeviceName))
+    if r == 0 {
+        Ok(from_wide(&name.viewGdiDeviceName))
+    } else {
+        Err(format!(
+            "DisplayConfigGetDeviceInfo(GET_SOURCE_NAME) failed for source {}:{}: {} (0x{:08X})",
+            name.header.adapterId.HighPart as u32, name.header.adapterId.LowPart, r, r as u32
+        ))
+    }
 }
 
-/// Waits until the newly added target shows up as an active path and returns
-/// its GDI name (e.g. `\\.\DISPLAY5`). Equivalent of `GetAddedDisplayName`.
-pub fn wait_for_display_name(adapter: LUID, target_id: u32, timeout: Duration) -> Option<String> {
+fn summarize_path(path: &DISPLAYCONFIG_PATH_INFO) -> String {
+    format!(
+        "source={:08X}:{:08X}/{} target={:08X}:{:08X}/{} active={}",
+        path.sourceInfo.adapterId.HighPart as u32,
+        path.sourceInfo.adapterId.LowPart,
+        path.sourceInfo.id,
+        path.targetInfo.adapterId.HighPart as u32,
+        path.targetInfo.adapterId.LowPart,
+        path.targetInfo.id,
+        path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0
+    )
+}
+
+fn summarize_paths(paths: &[DISPLAYCONFIG_PATH_INFO]) -> String {
+    if paths.is_empty() {
+        return "<none>".into();
+    }
+    paths
+        .iter()
+        .map(summarize_path)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Waits for the target to become active and separately diagnoses whether Windows
+/// knows it as an inactive path. QDC_ALL_PATHS is only queried after a timeout because
+/// Microsoft documents it as an expensive query.
+pub fn wait_for_display_name(
+    adapter: LUID,
+    target_id: u32,
+    timeout: Duration,
+) -> Result<String, String> {
     let deadline = Instant::now() + timeout;
+    let mut last_query_error = None;
+    let mut last_source_name_error = None;
+
     loop {
-        if let Ok(cfg) = Config::query()
-            && let Some(i) = cfg.path_index_by_target(adapter, target_id)
-            && let Some(name) = source_gdi_name(&cfg.paths[i])
-        {
-            return Some(name);
+        match Config::query() {
+            Ok(cfg) => {
+                if let Some(i) = cfg.path_index_by_target(adapter, target_id) {
+                    match source_gdi_name(&cfg.paths[i]) {
+                        Ok(name) => return Ok(name),
+                        Err(error) => last_source_name_error = Some(error),
+                    }
+                }
+            }
+            Err(error) => last_query_error = Some(error),
         }
+
         if Instant::now() >= deadline {
-            return None;
+            break;
         }
         sleep(Duration::from_millis(100));
     }
+
+    let active_details = match Config::query() {
+        Ok(cfg) => format!(
+            "{} active path(s): {}",
+            cfg.paths.len(),
+            summarize_paths(&cfg.paths)
+        ),
+        Err(error) => format!("active-path query failed: {error}"),
+    };
+    let all_path_details = match Config::query_with_flags(QDC_ALL_PATHS) {
+        Ok(cfg) => match cfg.path_index_by_target(adapter, target_id) {
+            Some(i) => {
+                let path = &cfg.paths[i];
+                if path.flags & DISPLAYCONFIG_PATH_ACTIVE != 0 {
+                    format!(
+                        "target is present in QDC_ALL_PATHS and flagged active: {}",
+                        summarize_path(path)
+                    )
+                } else {
+                    format!(
+                        "target is known to Windows but inactive: {}",
+                        summarize_path(path)
+                    )
+                }
+            }
+            None => "target is absent from QDC_ALL_PATHS".into(),
+        },
+        Err(error) => format!("QDC_ALL_PATHS diagnostic failed: {error}"),
+    };
+
+    Err(format!(
+        "virtual display target {target_id} (adapter {:08X}:{:08X}) was not discoverable as an active display within {timeout:?}; {all_path_details}; {active_details}; last_query_error={}; last_source_name_error={}",
+        adapter.HighPart as u32,
+        adapter.LowPart,
+        last_query_error.as_deref().unwrap_or("<none>"),
+        last_source_name_error.as_deref().unwrap_or("<none>")
+    ))
 }
 
 /// Waits until the given target is no longer an active path.
@@ -200,7 +346,7 @@ pub fn set_mode(device: &str, width: u32, height: u32, refresh_mhz: u32) -> Resu
     let idx = cfg
         .paths
         .iter()
-        .position(|p| source_gdi_name(p).as_deref() == Some(device))
+        .position(|p| source_gdi_name(p).ok().as_deref() == Some(device))
         .ok_or_else(|| format!("display {device} not found"))?;
     let mode_idx = cfg
         .source_mode_index(&cfg.paths[idx])
@@ -247,12 +393,12 @@ pub fn set_primary(adapter: LUID, target_id: u32) -> Result<(), String> {
     cfg.apply(SDC_ALLOW_CHANGES)
 }
 
-/// Deactivates every display except the virtual one.
+/// Deactivates every display except the virtual one, then verifies the resulting topology.
 pub fn make_exclusive(adapter: LUID, target_id: u32) -> Result<(), String> {
     let mut cfg = Config::query()?;
     let keep = cfg
         .path_index_by_target(adapter, target_id)
-        .ok_or("virtual display path not found")?;
+        .ok_or("virtual display path not found in the active topology")?;
     if let Some(m) = cfg.source_mode_index(&cfg.paths[keep]) {
         unsafe {
             let pos = &mut cfg.modes[m].Anonymous.sourceMode.position;
@@ -268,7 +414,34 @@ pub fn make_exclusive(adapter: LUID, target_id: u32) -> Result<(), String> {
         path.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
         path.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
     }
-    cfg.apply(SDC_ALLOW_CHANGES)
+
+    cfg.apply(SDC_ALLOW_CHANGES)?;
+    log!("exclusive: SetDisplayConfig accepted; verifying active display topology");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut last_state = "no verification result".to_string();
+    while Instant::now() < deadline {
+        match Config::query() {
+            Ok(current) => {
+                let target_active = current.path_index_by_target(adapter, target_id).is_some();
+                if target_active && current.paths.len() == 1 {
+                    log!("exclusive: verified exactly one active display (target {target_id})");
+                    return Ok(());
+                }
+                last_state = format!(
+                    "{} active path(s), target_active={target_active}: {}",
+                    current.paths.len(),
+                    summarize_paths(&current.paths)
+                );
+            }
+            Err(error) => last_state = error,
+        }
+        sleep(Duration::from_millis(100));
+    }
+
+    Err(format!(
+        "exclusive layout was not verified within 3 seconds; expected only target {target_id}; last state: {last_state}"
+    ))
 }
 
 pub fn set_hdr(adapter: LUID, target_id: u32, enable: bool) -> Result<(), String> {
