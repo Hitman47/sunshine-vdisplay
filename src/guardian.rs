@@ -444,27 +444,28 @@ pub fn self_test() -> Result<(), String> {
 
     let before = Config::query()
         .map_err(|e| format!("cannot capture display topology before guardian self-test: {e}"))?;
-    let test_guid = GUID::from_u128(0);
+    let mut guardian = Guardian::start(GUID::from_u128(0))?;
+    println!("Guardian armed for transition-mutex test. No display will be created or changed.");
 
-    // Phase 1: prove that an emergency request waits for the daemon's transition mutex.
-    let mut mutex_guardian = Guardian::start(test_guid)?;
-    println!("Guardian self-test 1/3: transition mutex (no display changes).");
-    let transition = mutex_guardian.begin_transition()?;
-    if unsafe { SetEvent(mutex_guardian.restore.raw()) } == 0 {
+    // Simulate a daemon display transition in progress. The guardian is asked to
+    // restore while this thread owns the mutex; it must signal Emergency and wait.
+    let transition = guardian.begin_transition()?;
+    if unsafe { SetEvent(guardian.restore.raw()) } == 0 {
         drop(transition);
-        let cleanup = mutex_guardian.restore_and_wait();
+        let cleanup = guardian.restore_and_wait();
         return Err(format!(
-            "cannot request guardian mutex self-test restoration: {}; cleanup={}",
+            "cannot request guardian self-test restoration: {}; cleanup={}",
             std::io::Error::last_os_error(),
             cleanup.err().unwrap_or_else(|| "ok".into())
         ));
     }
+
     let emergency_deadline = Instant::now() + Duration::from_secs(3);
     loop {
-        if mutex_guardian.emergency_pending()? {
+        if guardian.emergency_pending()? {
             break;
         }
-        if !mutex_guardian.is_running()? {
+        if !guardian.is_running()? {
             drop(transition);
             return Err(
                 "guardian exited before signaling emergency while the transition mutex was held"
@@ -473,93 +474,41 @@ pub fn self_test() -> Result<(), String> {
         }
         if Instant::now() >= emergency_deadline {
             drop(transition);
-            let cleanup = mutex_guardian.restore_and_wait();
+            let cleanup = guardian.restore_and_wait();
             return Err(format!(
-                "guardian did not signal emergency within 3 seconds; cleanup={}",
+                "guardian did not signal the emergency event within 3 seconds; cleanup={}",
                 cleanup.err().unwrap_or_else(|| "ok".into())
             ));
         }
         thread::sleep(Duration::from_millis(20));
     }
+
+    println!("Guardian requested restoration; verifying it waits for the transition mutex...");
     let hold_deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < hold_deadline {
-        if !mutex_guardian.is_running()? {
+        if !guardian.is_running()? {
             drop(transition);
-            return Err("guardian exited before transition-mutex release".into());
+            return Err("guardian exited before the transition mutex was released".into());
         }
         thread::sleep(Duration::from_millis(20));
     }
+
+    // Release the mutex on the same thread that acquired it, then require a clean
+    // guardian exit. No display operation is possible with the reserved zero GUID.
     drop(transition);
-    mutex_guardian.restore_and_wait()?;
-    let after_mutex =
-        Config::query().map_err(|e| format!("cannot query topology after mutex self-test: {e}"))?;
-    if !before.same_active_layout(&after_mutex) {
-        return Err("guardian mutex self-test changed the active display topology".into());
-    }
-    println!("SUCCESS 1/3: guardian waited for transition-mutex release; topology unchanged.");
+    guardian.restore_and_wait()?;
 
-    // Phase 2: exercise the real exclusive-start -> confirmation -> acknowledgement
-    // event sequence, but with the reserved zero GUID and therefore no display APIs.
-    let mut confirmation_guardian = Guardian::start(test_guid)?;
-    crate::ipc::signal_guardian_exclusive_started()?;
-    crate::ipc::confirm_exclusive_self_test()?;
-    thread::sleep(Duration::from_millis(500));
-    if let Some(status) = confirmation_guardian.try_wait()? {
-        return Err(format!(
-            "guardian exited after acknowledging the confirmation test (status {status})"
-        ));
-    }
-    confirmation_guardian.restore_and_wait()?;
-    let after_confirmation = Config::query()
-        .map_err(|e| format!("cannot query topology after confirmation self-test: {e}"))?;
-    if !before.same_active_layout(&after_confirmation) {
-        return Err("exclusive confirmation self-test changed the active display topology".into());
-    }
-    println!(
-        "SUCCESS 2/3: exclusive-start event and confirmation acknowledgement succeeded; topology unchanged."
-    );
-
-    // Phase 3: let the actual 30-second safety window expire. Keep sending heartbeats
-    // so this can only complete because the independent confirmation deadline fired.
-    let mut timeout_guardian = Guardian::start(test_guid)?;
-    crate::ipc::signal_guardian_exclusive_started()?;
-    let test_deadline = Instant::now() + Duration::from_secs(36);
-    let mut next_heartbeat = Instant::now();
-    loop {
-        if let Some(status) = timeout_guardian.try_wait()? {
-            if !status.success() {
-                return Err(format!(
-                    "guardian exited abnormally after confirmation timeout: {status}"
-                ));
-            }
-            break;
-        }
-        if Instant::now() >= test_deadline {
-            let cleanup = timeout_guardian.restore_and_wait();
-            return Err(format!(
-                "guardian did not expire the 30-second confirmation window within 36 seconds; cleanup={}",
-                cleanup.err().unwrap_or_else(|| "ok".into())
-            ));
-        }
-        if Instant::now() >= next_heartbeat {
-            timeout_guardian.heartbeat()?;
-            next_heartbeat = Instant::now() + Duration::from_secs(1);
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    let after_timeout = Config::query()
-        .map_err(|e| format!("cannot query topology after timeout self-test: {e}"))?;
-    if !before.same_active_layout(&after_timeout) {
+    let after = Config::query()
+        .map_err(|e| format!("cannot verify display topology after guardian self-test: {e}"))?;
+    if !before.same_active_layout(&after) {
         return Err(
-            "exclusive confirmation-timeout self-test changed the active display topology".into(),
+            "guardian mutex self-test detected a display-topology difference; do not enable --exclusive"
+                .into(),
         );
     }
 
     println!(
-        "SUCCESS 3/3: unconfirmed 30-second safety window expired with heartbeats active; guardian restored and topology remained unchanged."
-    );
-    println!(
-        "SUCCESS: guardian transition mutex, confirmation handshake, and automatic safety timeout all verified without changing displays."
+        "SUCCESS: guardian signaled emergency, waited for transition-mutex release, restored, and verified the original topology unchanged."
     );
     Ok(())
 }
@@ -634,9 +583,7 @@ fn run(args: &[String]) -> Result<(), String> {
             CreateEventW(std::ptr::null(), 1, 0, emergency_wide.as_ptr()),
             "CreateEventW(guardian emergency)",
         )?
-    }; // Unique global event lets the daemon arm the timer only after make_exclusive succeeds.
-    // The IPC helper applies the same permissive low-integrity DACL as start/stop.
-    let exclusive_started = crate::ipc::create_guardian_exclusive_started_event()?;
+    };
 
     let registered = unsafe {
         RegisterHotKey(
@@ -663,9 +610,7 @@ fn run(args: &[String]) -> Result<(), String> {
     );
 
     let mut last_heartbeat = Instant::now();
-    let mut exclusive_test_started = false;
-    let mut confirmation_deadline: Option<Instant> = None;
-    let mut confirmation_events: Option<(crate::ipc::Handle, crate::ipc::Handle)> = None;
+    let handles = [parent.raw(), heartbeat.raw(), restore.raw()];
     let restore_reason = 'guardian: loop {
         // RegisterHotKey(NULL, ...) posts WM_HOTKEY to this thread's message
         // queue; pump it on the same thread that registered the hotkey.
@@ -684,81 +629,32 @@ fn run(args: &[String]) -> Result<(), String> {
             }
         }
 
-        if confirmation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            break 'guardian "exclusive test confirmation timed out";
-        }
-
-        let mut handles = vec![parent.raw(), heartbeat.raw(), restore.raw()];
-        if let Some((confirmation, _)) = confirmation_events.as_ref() {
-            handles.push(confirmation.raw());
-        } else if !exclusive_test_started {
-            handles.push(exclusive_started.raw());
-        }
         let wait = unsafe {
             WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, POLL_INTERVAL_MS)
         };
         match wait {
-            WAIT_OBJECT_0 => break 'guardian "daemon process exited",
+            WAIT_OBJECT_0 => break "daemon process exited",
             x if x == WAIT_OBJECT_0 + 1 => last_heartbeat = Instant::now(),
-            x if x == WAIT_OBJECT_0 + 2 => break 'guardian "daemon requested restoration",
-            x if x == WAIT_OBJECT_0 + 3 => {
-                if confirmation_events.is_some() {
-                    if confirmation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        break 'guardian "exclusive test confirmation timed out";
-                    }
-                    let (confirmation, acknowledgement) = confirmation_events
-                        .take()
-                        .expect("confirmation event presence was checked");
-                    if unsafe { SetEvent(acknowledgement.raw()) } == 0 {
-                        crate::log!(
-                            "guardian: could not acknowledge exclusive confirmation: {}",
-                            std::io::Error::last_os_error()
-                        );
-                        break 'guardian "exclusive confirmation acknowledgement failed";
-                    }
-                    drop(confirmation);
-                    drop(acknowledgement);
-                    confirmation_deadline = None;
-                    crate::log!(
-                        "guardian: exclusive test confirmed; 30-second automatic restoration cancelled; normal heartbeat/hotkey supervision remains active"
-                    );
-                } else {
-                    exclusive_test_started = true;
-                    match crate::ipc::create_guardian_exclusive_confirmation_events() {
-                        Ok(events) => {
-                            confirmation_events = Some(events);
-                            confirmation_deadline = Some(Instant::now() + Duration::from_secs(30));
-                            crate::log!(
-                                "guardian: 30-second exclusive safety window started; run vdisplay confirm-exclusive to keep the session, otherwise displays will be restored"
-                            );
-                        }
-                        Err(error) => {
-                            crate::log!(
-                                "guardian: cannot create exclusive confirmation channel: {error}"
-                            );
-                            break 'guardian "exclusive confirmation channel unavailable";
-                        }
-                    }
-                }
-            }
+            x if x == WAIT_OBJECT_0 + 2 => break "daemon requested restoration",
             WAIT_TIMEOUT => {}
             WAIT_FAILED => {
                 crate::log!(
                     "guardian: WaitForMultipleObjects failed: {}",
                     std::io::Error::last_os_error()
                 );
-                break 'guardian "guardian wait failure";
+                break "guardian wait failure";
             }
             other => {
                 crate::log!("guardian: unexpected wait result 0x{other:08X}");
-                break 'guardian "guardian wait failure";
+                break "guardian wait failure";
             }
         }
 
         if last_heartbeat.elapsed() >= HEARTBEAT_TIMEOUT {
-            break 'guardian "daemon heartbeat timed out";
+            break "daemon heartbeat timed out";
         }
     };
+
     crate::log!("guardian: restoration triggered: {restore_reason}");
     if unsafe { SetEvent(emergency.raw()) } == 0 {
         crate::log!(

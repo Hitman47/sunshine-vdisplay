@@ -308,11 +308,6 @@ fn cmd_start(args: &[String]) -> Result<(), String> {
     if let Some(name) = line.strip_prefix("READY ") {
         log!("virtual display ready: {name}");
         println!("{name}");
-        if opts.exclusive {
-            eprintln!(
-                "EXCLUSIVE SAFETY: run `vdisplay confirm-exclusive` within 30 seconds to keep this session; otherwise the independent guardian restores the previous displays."
-            );
-        }
         Ok(())
     } else if let Some(err) = line.strip_prefix("ERROR ") {
         Err(err.to_string())
@@ -330,16 +325,6 @@ fn cmd_stop() -> Result<(), String> {
     } else if !remove_stale_display() {
         log!("stop: no virtual display was active");
     }
-    Ok(())
-}
-fn cmd_confirm_exclusive(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: vdisplay confirm-exclusive".into());
-    }
-    ipc::confirm_exclusive()?;
-    println!(
-        "Guardian acknowledged: exclusive session retained; emergency recovery remains armed."
-    );
     Ok(())
 }
 
@@ -762,22 +747,6 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
         }
     }
 
-    if opts.exclusive {
-        if let Err(error) = ipc::signal_guardian_exclusive_started() {
-            log!("ERROR: cannot start the independent 30-second exclusive safety window: {error}");
-            teardown(&driver, &mut guardian);
-            pinging.store(false, Ordering::Relaxed);
-            if let Some(p) = pinger {
-                let _ = p.join();
-            }
-            return Err(format!(
-                "exclusive session restored because its safety window could not be armed: {error}"
-            ));
-        }
-        log!(
-            "exclusive: 30-second safety window started; run vdisplay confirm-exclusive to keep this session"
-        );
-    }
     {
         let mut out = std::io::stdout();
         let _ = writeln!(out, "READY {device}");
@@ -1056,7 +1025,6 @@ fn main() -> ExitCode {
     let result = match cmd {
         "start" => cmd_start(rest),
         "stop" => cmd_stop(),
-        "confirm-exclusive" => cmd_confirm_exclusive(rest),
         "daemon" => cmd_daemon(rest),
         "guardian" => guardian::cmd(rest),
         "guardian-test" => guardian::self_test(),
