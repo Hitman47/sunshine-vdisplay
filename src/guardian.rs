@@ -13,7 +13,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows::Win32::Devices::Display::SDC_ALLOW_CHANGES;
 use windows::core::GUID;
 
 use crate::display::Config;
@@ -774,7 +773,7 @@ fn restore_until_verified(driver: &Driver, guid: GUID, snapshot: &Config) -> Res
         }
 
         let mut candidate = snapshot.clone();
-        match candidate.apply(SDC_ALLOW_CHANGES) {
+        match candidate.apply(windows::Win32::Devices::Display::SET_DISPLAY_CONFIG_FLAGS(0)) {
             Ok(()) => crate::log!("guardian: applied saved topology (attempt {attempt})"),
             Err(error) => {
                 crate::log!("guardian: topology restore attempt {attempt} failed: {error}")

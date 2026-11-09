@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use windows::Win32::Devices::Display::SDC_ALLOW_CHANGES;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Console::{
     ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE,
@@ -517,7 +516,7 @@ fn teardown_session(
         let mut restored = false;
         for attempt in 1..=3 {
             let mut candidate = snapshot.clone();
-            match candidate.apply(SDC_ALLOW_CHANGES) {
+            match candidate.apply(windows::Win32::Devices::Display::SET_DISPLAY_CONFIG_FLAGS(0)) {
                 Ok(()) => {
                     std::thread::sleep(Duration::from_millis(350));
                     match display::Config::query() {
