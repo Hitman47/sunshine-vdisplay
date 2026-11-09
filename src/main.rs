@@ -516,7 +516,9 @@ fn teardown_session(
         let mut restored = false;
         for attempt in 1..=3 {
             let mut candidate = snapshot.clone();
-            match candidate.apply(windows::Win32::Devices::Display::SET_DISPLAY_CONFIG_FLAGS(0)) {
+            match candidate.apply(windows::Win32::Devices::Display::SET_DISPLAY_CONFIG_FLAGS(
+                0,
+            )) {
                 Ok(()) => {
                     std::thread::sleep(Duration::from_millis(350));
                     match display::Config::query() {
@@ -641,17 +643,45 @@ fn run_daemon(opts: &Options) -> Result<(), String> {
             guardian,
         );
     };
-    let device = match display::wait_for_display_name(
+    let initial_wait = if opts.exclusive { 3 } else { 10 };
+    let device_result = match display::wait_for_display_name(
         added.adapter_luid,
         added.target_id,
-        Duration::from_secs(10),
+        Duration::from_secs(initial_wait),
     ) {
+        Ok(device) => Ok(device),
+        Err(initial_error) if opts.exclusive => {
+            log!(
+                "exclusive: virtual display target {} exists but is inactive; requesting explicit Windows activation",
+                added.target_id
+            );
+            match with_guardian_transition(
+                guardian.as_ref(),
+                "inactive virtual display activation",
+                || display::activate_target(added.adapter_luid, added.target_id),
+            ) {
+                Ok(()) => display::wait_for_display_name(
+                    added.adapter_luid,
+                    added.target_id,
+                    Duration::from_secs(5),
+                )
+                .map_err(|error| {
+                    format!(
+                        "virtual display remained inactive after activation; initial detection: {initial_error}; final detection: {error}"
+                    )
+                }),
+                Err(error) => Err(format!(
+                    "virtual display activation failed: {error}; initial detection: {initial_error}"
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let device = match device_result {
         Ok(device) => device,
         Err(error) => {
             if opts.exclusive {
-                log!(
-                    "exclusive startup aborted before topology switching: the virtual display never became active, so a --primary fallback cannot be applied safely"
-                );
+                log!("exclusive startup aborted before topology switching: {error}");
             }
             teardown(&driver, &mut guardian);
             return Err(error);
@@ -940,6 +970,26 @@ fn cmd_guardian_recovery_test(args: &[String]) -> Result<(), String> {
             added.target_id,
             std::time::Duration::from_secs(10),
         )?;
+        println!("Activation fallback test: temporarily disabling the test VDD.");
+        with_guardian_transition(
+            Some(active_guardian),
+            "activation fallback test target deactivation",
+            || display::deactivate_target_for_test(added.adapter_luid, added.target_id),
+        )?;
+
+        println!("Test VDD is inactive. Calling activate_target() recovery path.");
+        with_guardian_transition(
+            Some(active_guardian),
+            "activation fallback recovery test",
+            || display::activate_target(added.adapter_luid, added.target_id),
+        )?;
+        let reactivated_device = display::wait_for_display_name(
+            added.adapter_luid,
+            added.target_id,
+            std::time::Duration::from_secs(5),
+        )?;
+        println!("SUCCESS: inactive test VDD was reactivated as {reactivated_device}.");
+
         if ping_failed.load(std::sync::atomic::Ordering::Relaxed) {
             return Err("SudoVDA watchdog ping failed during temporary monitor creation".into());
         }
